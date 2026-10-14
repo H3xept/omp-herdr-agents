@@ -1,0 +1,25 @@
+{
+	"name": "omp-herdr",
+	"version": "0.1.0",
+	"description": "omp plugin: spawn omp subagents as interactive sessions in herdr workspaces, tabs, or panes, each in its own working directory",
+	"keywords": ["omp", "oh-my-pi", "omp-plugin", "herdr", "agents", "subagents"],
+	"license": "MIT",
+	"type": "module",
+	"files": ["src", "README.md", "CHANGELOG.md", "LICENSE"],
+	"omp": {
+		"extensions": ["./src/index.ts"]
+	},
+	"scripts": {
+		"check": "tsc -p .",
+		"test": "bun test"
+	},
+	"engines": {
+		"omp": ">=18.10.4"
+	},
+	"devDependencies": {
+		"@oh-my-pi/omptype": "18.10.4",
+		"@oh-my-pi/pi-coding-agent": "18.10.4",
+		"@types/bun": "latest",
+		"typescript": "^5"
+	}
+}
