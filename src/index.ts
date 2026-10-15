@@ -120,6 +120,10 @@ export default function ompHerdr(pi: ExtensionAPI) {
 
 	const z = pi.zod;
 	const runs = new Map<string, Run>();
+	// A pane split measures the caller's pane to pick its direction. Placing one
+	// pane at a time lets each split see the previous one, so a batch tiles
+	// instead of slicing the caller into ever thinner columns.
+	let placementQueue: Promise<unknown> = Promise.resolve();
 
 	function settingRecord(id: string): Record<string, unknown> {
 		const value: unknown = lookup(id)?.get(pi.pi.settings);
@@ -156,13 +160,17 @@ export default function ompHerdr(pi: ExtensionAPI) {
 			approvalMode: process.env.OMP_HERDR_APPROVAL_MODE || "yolo",
 		});
 
-		const pane = await placePane({
-			placement: item.placement ?? "workspace",
-			workspace: item.workspace,
-			cwd,
-			label: name,
-			env: { [ENV_RUN_DIR]: runDir },
-		});
+		const placed = placementQueue.then(() =>
+			placePane({
+				placement: item.placement ?? "workspace",
+				workspace: item.workspace,
+				cwd,
+				label: name,
+				env: { [ENV_RUN_DIR]: runDir },
+			}),
+		);
+		placementQueue = placed.catch(() => undefined);
+		const pane = await placed;
 		// herdr reports a new pane as `agent_pane_busy` until its shell is up.
 		const shellDeadline = Date.now() + SHELL_READY_TIMEOUT_MS;
 		for (;;) {

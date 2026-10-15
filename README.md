@@ -1,5 +1,7 @@
 # omp-herdr-agents
 
+![A parent omp agent calls herdr_task. Two agents open in new herdr panes, one in ../api and one in ../mobile, investigate in parallel, and report back.](assets/banner.gif)
+
 An [omp](https://omp.sh) plugin that spawns omp subagents as interactive omp sessions in [herdr](https://herdr.dev). Each agent runs in its own working directory and gets its own herdr workspace, tab, or pane.
 
 The built-in `task` tool runs subagents inside the parent process, in the parent's working directory. You cannot watch them or talk to them. `omp-herdr-agents` adds two tools with the same contract as `task`:
