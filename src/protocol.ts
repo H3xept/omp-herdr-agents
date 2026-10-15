@@ -9,7 +9,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { type } from "@oh-my-pi/omptype";
+import { type } from "@oh-my-pi/pi-ai";
 
 export const ENV_RUN_DIR = "OMP_HERDR_RUN_DIR";
 export const RESULT_FILE = "result.json";

@@ -101,7 +101,7 @@ bun run check   # tsc
 bun test
 ```
 
-`@oh-my-pi/pi-coding-agent` and `@oh-my-pi/omptype` are dev dependencies for types and tests only. At runtime the omp extension loader resolves `@oh-my-pi/*` imports to the running omp.
+`@oh-my-pi/pi-coding-agent` is a dev dependency for types and tests only. The plugin has no runtime dependencies: the omp extension loader resolves the host's `@oh-my-pi/pi-*` packages (`pi-coding-agent`, `pi-ai`, …) to the running omp. Import only from those packages; any other import needs a real entry in `dependencies`.
 
 ## License
 

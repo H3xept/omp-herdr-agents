@@ -21,7 +21,6 @@
 		"omp": ">=18.10.4"
 	},
 	"devDependencies": {
-		"@oh-my-pi/omptype": "18.10.4",
 		"@oh-my-pi/pi-coding-agent": "18.10.4",
 		"@types/bun": "latest",
 		"typescript": "^5"

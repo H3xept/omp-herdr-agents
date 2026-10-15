@@ -3,7 +3,7 @@
  * envelope `{ id, result }` on success, or `{ id, error: { code, message } }`
  * on stderr with exit status 1. Responses are validated before use.
  */
-import { type } from "@oh-my-pi/omptype";
+import { type } from "@oh-my-pi/pi-ai";
 
 export class HerdrError extends Error {
 	constructor(
