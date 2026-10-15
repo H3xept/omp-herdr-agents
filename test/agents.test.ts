@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { Model } from "@oh-my-pi/pi-ai";
-import { allocateName, chooseModel } from "../src/agents";
+import { allocateName, buildChildArgv, chooseModel } from "../src/agents";
 
 const HERDR_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
 
@@ -19,6 +19,19 @@ describe("allocateName", () => {
 		expect(first).toBe("scout-2");
 		expect(second).toBe("scout-3");
 		expect(taken.has(first) && taken.has(second)).toBe(true);
+	});
+});
+
+describe("buildChildArgv", () => {
+	const base = { childExtension: "/x/child.ts", systemPromptFile: "/run/system-prompt.md", model: {} };
+	const toolsFlag = (argv: string[]) => argv[argv.indexOf("--tools") + 1];
+
+	test("an agent with a tool list can still message its parent", () => {
+		expect(toolsFlag(buildChildArgv({ ...base, tools: ["read", "grep"] }))).toBe("read,grep,message_parent");
+	});
+
+	test("an agent without a tool list gets every tool", () => {
+		expect(buildChildArgv({ ...base, tools: [] })).not.toContain("--tools");
 	});
 });
 

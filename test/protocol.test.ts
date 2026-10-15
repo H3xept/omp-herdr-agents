@@ -3,31 +3,45 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { summarizeTurn } from "../src/child";
-import { RESULT_FILE, readResult, writeResult } from "../src/protocol";
+import { appendInbox, INBOX_FILE, readInbox, readRunFile, runFilePath, writeRunFile } from "../src/protocol";
 
-describe("result file", () => {
-	let dir: string;
-	beforeEach(async () => {
-		dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-herdr-test-"));
-	});
-	afterEach(async () => {
-		await fs.rm(dir, { recursive: true, force: true });
+let dir: string;
+beforeEach(async () => {
+	dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-herdr-test-"));
+});
+afterEach(async () => {
+	await fs.rm(dir, { recursive: true, force: true });
+});
+
+describe("run files", () => {
+	test("are absent until written", async () => {
+		expect(await readRunFile(dir, "result")).toBeUndefined();
 	});
 
-	test("is absent until the child reports", async () => {
-		expect(await readResult(dir)).toBeUndefined();
-	});
-
-	test("round-trips the latest report", async () => {
+	test("round-trip the latest write", async () => {
 		const report = { seq: 2, status: "completed" as const, output: "PELICAN", finishedAt: "2026-10-15T00:00:00Z" };
-		await writeResult(dir, { ...report, seq: 1 });
-		await writeResult(dir, report);
-		expect(await readResult(dir)).toEqual(report);
+		await writeRunFile(dir, "result", { ...report, seq: 1 });
+		await writeRunFile(dir, "result", report);
+		expect(await readRunFile(dir, "result")).toEqual(report);
 	});
 
-	test("rejects a malformed report instead of returning it", async () => {
-		await Bun.write(path.join(dir, RESULT_FILE), JSON.stringify({ seq: "1", status: "done" }));
-		await expect(readResult(dir)).rejects.toThrow(RESULT_FILE);
+	test("reject a malformed file instead of returning it", async () => {
+		await Bun.write(runFilePath(dir, "result"), JSON.stringify({ seq: "1", status: "done" }));
+		await expect(readRunFile(dir, "result")).rejects.toThrow("result.json");
+	});
+});
+
+describe("inbox", () => {
+	test("returns messages oldest first", async () => {
+		await appendInbox(dir, { at: "t1", text: "first" });
+		await appendInbox(dir, { at: "t2", text: "second" });
+		expect((await readInbox(dir)).map(message => message.text)).toEqual(["first", "second"]);
+	});
+
+	test("skips a line the child is still writing", async () => {
+		await appendInbox(dir, { at: "t1", text: "complete" });
+		await fs.appendFile(path.join(dir, INBOX_FILE), '{"at":"t2","te');
+		expect((await readInbox(dir)).map(message => message.text)).toEqual(["complete"]);
 	});
 });
 
@@ -41,17 +55,17 @@ describe("summarizeTurn", () => {
 		stopReason,
 		errorMessage,
 	});
+	// Only role/content/stopReason are read; full AgentMessage objects carry unrelated metadata.
+	type Turn = Parameters<typeof summarizeTurn>[0];
 
 	test("reports the final assistant text, not earlier turns or thinking", () => {
 		const messages = [assistant("toolUse", "working on it"), { role: "user", content: "x" }, assistant("stop", "PELICAN")];
-		// Only role/content/stopReason are read; full AgentMessage objects carry unrelated metadata.
-		const turn = messages as unknown as Parameters<typeof summarizeTurn>[0];
-		expect(summarizeTurn(turn)).toMatchObject({ status: "completed", output: "PELICAN" });
+		expect(summarizeTurn(messages as unknown as Turn)).toMatchObject({ status: "completed", output: "PELICAN" });
 	});
 
 	test("maps provider errors and aborts to failed and aborted", () => {
-		const failed = [assistant("error", "", "429 rate limited")] as unknown as Parameters<typeof summarizeTurn>[0];
-		const aborted = [assistant("aborted", "partial")] as unknown as Parameters<typeof summarizeTurn>[0];
+		const failed = [assistant("error", "", "429 rate limited")] as unknown as Turn;
+		const aborted = [assistant("aborted", "partial")] as unknown as Turn;
 		expect(summarizeTurn(failed)).toMatchObject({ status: "failed", error: "429 rate limited" });
 		expect(summarizeTurn(aborted)).toMatchObject({ status: "aborted", output: "partial" });
 	});

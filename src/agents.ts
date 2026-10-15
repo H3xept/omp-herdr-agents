@@ -6,6 +6,7 @@
 import type { ExtensionModelQuery } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { discoverAgents, getAgent } from "@oh-my-pi/pi-coding-agent/task/discovery";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import { MESSAGE_PARENT_TOOL } from "./protocol";
 
 export type { AgentDefinition };
 
@@ -81,6 +82,7 @@ export function buildSystemPrompt({ agent, context, name, parentCwd, cwd }: Prom
 			`You run as an interactive omp session in a herdr pane; your herdr agent name is \`${name}\`.`,
 			"A human can watch this pane and may type to you directly; treat their messages as authoritative.",
 			`Your working directory is \`${cwd}\`. The parent agent works in \`${parentCwd}\`.`,
+			"Use the `message_parent` tool to send the parent a message while you keep working: an early finding it needs, or a question it can answer while you continue. It does not wait for a reply; replies arrive as user messages. The parent may be blocked waiting for your result, so never stop to wait for an answer. If you cannot continue without one, end your turn with the question and what you need.",
 		].join("\n"),
 	);
 	const completion = [
@@ -122,7 +124,8 @@ export function buildChildArgv({ childExtension, systemPromptFile, model, tools,
 	const argv = ["-e", childExtension, "--append-system-prompt", systemPromptFile];
 	if (model.model) argv.push("--model", model.model);
 	if (model.thinking) argv.push("--thinking", model.thinking);
-	if (tools && tools.length > 0) argv.push("--tools", tools.join(","));
+	// An explicit tool list hides extension tools it does not name.
+	if (tools && tools.length > 0) argv.push("--tools", [...tools, MESSAGE_PARENT_TOOL].join(","));
 	if (approvalMode) argv.push("--approval-mode", approvalMode);
 	return argv;
 }

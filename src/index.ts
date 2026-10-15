@@ -1,13 +1,17 @@
 /**
- * omp-herdr: spawn omp subagents as visible, interactive omp sessions in herdr
- * workspaces, tabs, or panes — each in its own working directory.
+ * omp-herdr-agents: spawn omp subagents as visible, interactive omp sessions in
+ * herdr workspaces, tabs, or panes — each in its own working directory.
  *
- * `herdr_task` mirrors the built-in `task` tool (same agent types, batch shape,
- * final-message result); `herdr_send` sends a follow-up to an agent it spawned.
+ * - `herdr_task` mirrors the built-in `task` tool: same agent types, batch
+ *   shape, final-message result, live progress, and background delivery.
+ * - `herdr_send` sends a follow-up to a spawned agent.
+ * - `herdr_agents` lists, inspects, interrupts, and closes spawned agents.
+ * - Spawned agents message the parent with `message_parent` (see `child.ts`).
  */
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import {
@@ -18,40 +22,26 @@ import {
 	chooseModel,
 	findAgent,
 } from "./agents";
+import { formatOutcome, formatProgress, formatTranscript, formatUsage } from "./format";
 import { HerdrError, type HerdrPane, herdr } from "./herdr";
-import { type ChildResult, ENV_RUN_DIR, readResult, SYSTEM_PROMPT_FILE } from "./protocol";
+import { ENV_RUN_DIR, readRunFile, SYSTEM_PROMPT_FILE } from "./protocol";
+import { AgentRun, type Outcome, RunRecord, type RunHooks } from "./runs";
 
 const CHILD_EXTENSION = path.join(import.meta.dir, "child.ts");
 const START_TIMEOUT_MS = 60_000;
 const PROMPT_TIMEOUT_MS = 60_000;
-const POLL_MS = 1_000;
-const STATUS_EVERY_POLLS = 3;
-const MAX_INLINE_OUTPUT = 30_000;
 /** How long a freshly created pane may take to start its shell. */
 const SHELL_READY_TIMEOUT_MS = 15_000;
 const SHELL_READY_POLL_MS = 250;
+const DEFAULT_TRANSCRIPT_LINES = 40;
+/** Session entry that records a spawned agent, so a restarted parent can resume it. */
+const RECORD_ENTRY = "omp-herdr-agent";
+/** Session entry that marks a spawned agent as closed. */
+const CLOSED_ENTRY = "omp-herdr-agent-closed";
+
+const ClosedEntry = type({ name: "string" });
 
 type Placement = "workspace" | "tab" | "pane";
-
-/** One spawned herdr agent, tracked for follow-ups and result delivery. */
-interface Run {
-	name: string;
-	agent: string;
-	cwd: string;
-	paneId: string;
-	workspaceId: string;
-	runDir: string;
-}
-
-/** What a waiting call reports for one agent. */
-interface Outcome {
-	run: Run;
-	status: ChildResult["status"] | "lost";
-	output: string;
-	error?: string;
-	durationMs: number;
-	resultFile: string;
-}
 
 interface Row {
 	label: string;
@@ -95,39 +85,108 @@ async function placePane(opts: {
 	return (await herdr.createTab({ workspace, cwd, label, env })).root_pane;
 }
 
-function formatDuration(ms: number): string {
-	const seconds = Math.round(ms / 1000);
-	return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, "0")}s`;
-}
-
-function formatOutcome(outcome: Outcome): string {
-	const { run } = outcome;
-	const header = `## ${run.name} (${run.agent}) — ${outcome.status} in ${formatDuration(outcome.durationMs)}`;
-	const where = `herdr pane ${run.paneId} · workspace ${run.workspaceId} · cwd ${run.cwd}`;
-	const output =
-		outcome.output.length > MAX_INLINE_OUTPUT
-			? `${outcome.output.slice(0, MAX_INLINE_OUTPUT)}\n\n[truncated; full output in ${outcome.resultFile}]`
-			: outcome.output;
-	const lines = [header, where];
-	if (outcome.error) lines.push(`error: ${outcome.error}`);
-	lines.push("", output || "(no final message)");
-	return lines.join("\n");
-}
-
 export default function ompHerdr(pi: ExtensionAPI) {
 	// The tools drive the herdr session this process lives in; outside herdr there is none.
 	if (process.env.HERDR_ENV !== "1") return;
 
 	const z = pi.zod;
-	const runs = new Map<string, Run>();
+	const runs = new Map<string, AgentRun>();
 	// A pane split measures the caller's pane to pick its direction. Placing one
 	// pane at a time lets each split see the previous one, so a batch tiles
 	// instead of slicing the caller into ever thinner columns.
 	let placementQueue: Promise<unknown> = Promise.resolve();
 
+	const hooks: RunHooks = {
+		onMessages(run, messages) {
+			const { name, agent, cwd } = run.record;
+			const body = messages.map(message => message.text).join("\n\n");
+			pi.sendMessage(
+				{
+					customType: "omp-herdr-message",
+					content: [
+						`<herdr-agent-message from="${name}">`,
+						body,
+						"</herdr-agent-message>",
+						`The herdr agent \`${name}\` (${agent}, cwd ${cwd}) sent this with message_parent and keeps working.`,
+						`If a reply is needed, send it with herdr_send (name "${name}", background true): it reaches the agent as a steer. No one replies on your behalf.`,
+					].join("\n"),
+					display: true,
+					attribution: "agent",
+				},
+				{ deliverAs: "aside", triggerTurn: true },
+			);
+		},
+		onDelivery(outcome) {
+			pi.sendMessage(
+				{
+					customType: "omp-herdr-result",
+					content: `herdr agent result:\n\n${formatOutcome(outcome)}`,
+					display: true,
+					attribution: "agent",
+				},
+				{ deliverAs: "aside", triggerTurn: true },
+			);
+		},
+		onError(run, error) {
+			pi.logger.error("omp-herdr: monitoring failed", { agent: run.name, error: describeError(error) });
+		},
+	};
+
+	async function track(record: RunRecord): Promise<AgentRun> {
+		const run = new AgentRun(record, hooks);
+		runs.set(record.name, run);
+		await run.start();
+		return run;
+	}
+
+	function stopAll(reason: string) {
+		for (const run of runs.values()) run.stop(reason);
+		runs.clear();
+	}
+
+	/** Rebuild the tracked agents from the records on the session's active branch. */
+	async function restore(ctx: ExtensionContext) {
+		// Subagent sessions in this process load the extension too; only the main session owns herdr agents.
+		if (ctx.agent.kind !== "main") return;
+		stopAll("The parent session changed.");
+		const records = new Map<string, RunRecord>();
+		for (const entry of ctx.sessionManager.getBranch()) {
+			if (entry.type !== "custom") continue;
+			if (entry.customType === RECORD_ENTRY) {
+				const record = RunRecord(entry.data);
+				if (!(record instanceof type.errors)) records.set(record.name, record);
+			} else if (entry.customType === CLOSED_ENTRY) {
+				const closed = ClosedEntry(entry.data);
+				if (!(closed instanceof type.errors)) records.delete(closed.name);
+			}
+		}
+		for (const record of records.values()) {
+			// The system may have cleaned the temp directory since.
+			if (!(await fs.stat(record.runDir).catch(() => undefined))) continue;
+			await track(record).catch(error =>
+				pi.logger.error("omp-herdr: could not resume agent", { agent: record.name, error: describeError(error) }),
+			);
+		}
+	}
+
+	pi.on("session_start", (_event, ctx) => restore(ctx));
+	pi.on("session_switch", (_event, ctx) => restore(ctx));
+	pi.on("session_branch", (_event, ctx) => restore(ctx));
+	pi.on("session_tree", (_event, ctx) => restore(ctx));
+	pi.on("session_shutdown", (_event, ctx) => {
+		if (ctx.agent.kind === "main") stopAll("The parent session ended.");
+	});
+
 	function settingRecord(id: string): Record<string, unknown> {
 		const value: unknown = lookup(id)?.get(pi.pi.settings);
 		return value && typeof value === "object" ? Object.fromEntries(Object.entries(value)) : {};
+	}
+
+	function runNamed(name: string): AgentRun {
+		const run = runs.get(name);
+		if (run) return run;
+		const known = [...runs.keys()].join(", ") || "none";
+		throw new Error(`No herdr agent named "${name}" was spawned in this session. Known: ${known}.`);
 	}
 
 	async function spawn(
@@ -135,7 +194,7 @@ export default function ompHerdr(pi: ExtensionAPI) {
 		name: string,
 		context: string | undefined,
 		ctx: ExtensionContext,
-	): Promise<Run> {
+	): Promise<AgentRun> {
 		const cwd = await resolveCwd(item.cwd, ctx.cwd);
 		const agent = await findAgent(item.agent ?? "task", [ctx.cwd, cwd]);
 
@@ -184,70 +243,22 @@ export default function ompHerdr(pi: ExtensionAPI) {
 			}
 		}
 		await herdr.prompt(name, buildAssignment(item.task), PROMPT_TIMEOUT_MS);
-		return { name, agent: agent.name, cwd, paneId: pane.pane_id, workspaceId: pane.workspace_id, runDir };
+		const record: RunRecord = {
+			name,
+			agent: agent.name,
+			cwd,
+			paneId: pane.pane_id,
+			workspaceId: pane.workspace_id,
+			runDir,
+			task: item.task.slice(0, 200),
+			spawnedAt: new Date().toISOString(),
+		};
+		pi.appendEntry(RECORD_ENTRY, record);
+		return track(record);
 	}
 
-	/**
-	 * Poll the run directory for the first result newer than `afterSeq`; watch
-	 * herdr for an agent that quit. Each waiter keeps its own baseline, so a
-	 * background waiter and a `herdr_send` waiter on one agent both see the turn.
-	 */
-	async function waitForResult(
-		run: Run,
-		afterSeq: number,
-		signal: AbortSignal | undefined,
-		onState: (state: string) => void,
-	) {
-		const startedAt = Date.now();
-		const outcome = (status: Outcome["status"], output: string, error?: string): Outcome => ({
-			run,
-			status,
-			output,
-			error,
-			durationMs: Date.now() - startedAt,
-			resultFile: path.join(run.runDir, "result.json"),
-		});
-		for (let poll = 0; ; poll++) {
-			const result = await readResult(run.runDir);
-			if (result && result.seq > afterSeq) {
-				return outcome(result.status, result.output, result.error);
-			}
-			if (signal?.aborted) {
-				await herdr.sendKeys(run.name, ["esc"]).catch(() => undefined);
-				return outcome("aborted", await herdr.readTail(run.name, 40), "Cancelled by the parent agent.");
-			}
-			if (poll % STATUS_EVERY_POLLS === 0) {
-				try {
-					onState((await herdr.getAgent(run.name)).agent_status);
-				} catch (error) {
-					if (!(error instanceof HerdrError) || error.code !== "agent_not_found") throw error;
-					// The agent may have reported just before it exited.
-					const last = await readResult(run.runDir);
-					if (last && last.seq > afterSeq) continue;
-					return outcome("lost", "", `herdr agent ${run.name} exited or left pane ${run.paneId} before reporting.`);
-				}
-			}
-			await Bun.sleep(POLL_MS);
-		}
-	}
-
-	function deliverLater(outcomes: Promise<Outcome[]>) {
-		outcomes
-			.then(settled => {
-				pi.sendMessage(
-					{
-						customType: "omp-herdr-result",
-						content: `herdr agent results:\n\n${settled.map(formatOutcome).join("\n\n")}`,
-						display: true,
-						attribution: "agent",
-					},
-					{ deliverAs: "aside", triggerTurn: true },
-				);
-			})
-			.catch(error => {
-				pi.logger.error("omp-herdr: background wait failed", { error: describeError(error) });
-			});
-	}
+	const useBackground = (requested: boolean | undefined) =>
+		requested ?? lookup("async.enabled")?.get(pi.pi.settings) === true;
 
 	const placementSchema = z
 		.enum(["workspace", "tab", "pane"])
@@ -258,7 +269,9 @@ export default function ompHerdr(pi: ExtensionAPI) {
 	const backgroundSchema = z
 		.boolean()
 		.optional()
-		.describe("true: return at once; results arrive later as a message. Default: the session's async.enabled setting.");
+		.describe(
+			"true: return at once; each result arrives later as its own message. Default: the session's async.enabled setting.",
+		);
 	const herdrTaskParams = z.object({
 		context: z.string().optional().describe("Shared background added to every spawned agent's system prompt."),
 		background: backgroundSchema,
@@ -277,8 +290,17 @@ export default function ompHerdr(pi: ExtensionAPI) {
 	});
 	const herdrSendParams = z.object({
 		name: z.string().describe("herdr agent name returned by herdr_task."),
-		message: z.string().describe("Follow-up instruction or question."),
+		message: z.string().describe("Follow-up instruction, question, or reply to a message_parent message."),
 		background: backgroundSchema,
+	});
+	const herdrAgentsParams = z.object({
+		action: z
+			.enum(["list", "output", "transcript", "cancel", "close"])
+			.describe(
+				"list: every spawned agent with state and progress. output: an agent's latest final message in full. transcript: condensed recent activity from its session. cancel: interrupt its current turn (Esc). close: close its herdr pane and forget it.",
+			),
+		name: z.string().optional().describe("herdr agent name; required for every action except list."),
+		lines: z.number().int().positive().optional().describe(`transcript: lines to return. Default ${DEFAULT_TRANSCRIPT_LINES}.`),
 	});
 
 	pi.registerTool({
@@ -289,11 +311,15 @@ export default function ompHerdr(pi: ExtensionAPI) {
 			"Spawn subagents as interactive omp sessions in herdr, each in its own working directory.",
 			"Same agent types and contract as `task` (scout, task, reviewer, ...): each agent gets a self-contained assignment and its final message is the result.",
 			"Use it when the work belongs to another directory or repository, or when the user wants to watch or steer the agent in herdr.",
-			"Agents stay open in their panes after they finish; continue one with `herdr_send`.",
+			"While they work, agents may message you (`<herdr-agent-message>`); reply with `herdr_send`.",
+			"Agents stay open in their panes after they finish: continue one with `herdr_send`; list, inspect, interrupt, or close them with `herdr_agents`. The `wait` tool and `proc://`/`agent://` do not see herdr agents.",
 		].join("\n"),
 		parameters: herdrTaskParams,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const taken = new Set((await herdr.listAgents()).flatMap(agent => (agent.name ? [agent.name] : [])));
+			const taken = new Set([
+				...runs.keys(),
+				...(await herdr.listAgents()).flatMap(agent => (agent.name ? [agent.name] : [])),
+			]);
 			const names = params.tasks.map(item => allocateName(item.name ?? item.agent ?? "task", taken));
 			const rows: Row[] = names.map((name, i) => ({
 				label: `${name} (${params.tasks[i]?.agent ?? "task"})`,
@@ -315,8 +341,7 @@ export default function ompHerdr(pi: ExtensionAPI) {
 					const name = names[i] ?? item.agent ?? "task";
 					try {
 						const run = await spawn(item, name, params.context, ctx);
-						runs.set(run.name, run);
-						setState(i, `running in pane ${run.paneId}`);
+						setState(i, `started in pane ${run.record.paneId}`);
 						return run;
 					} catch (error) {
 						setState(i, `failed to start: ${describeError(error)}`);
@@ -324,18 +349,19 @@ export default function ompHerdr(pi: ExtensionAPI) {
 					}
 				}),
 			);
-			const started = spawned.filter((entry): entry is Run => !(entry instanceof Error));
+			const started = spawned.filter((entry): entry is AgentRun => !(entry instanceof Error));
 			const startErrors = spawned.flatMap((entry, i) =>
 				entry instanceof Error ? [`## ${names[i]} — failed to start\nerror: ${entry.message}`] : [],
 			);
 
-			const background = params.background ?? lookup("async.enabled")?.get(pi.pi.settings) === true;
-			if (background) {
-				if (started.length > 0) deliverLater(Promise.all(started.map(run => waitForResult(run, 0, undefined, () => {}))));
-				const lines = started.map(run => `- \`${run.name}\` (${run.agent}) in herdr pane ${run.paneId}, cwd ${run.cwd}`);
+			if (useBackground(params.background)) {
+				await Promise.all(started.map(run => run.awaitInBackground(0)));
+				const lines = started.map(
+					({ record }) => `- \`${record.name}\` (${record.agent}) in herdr pane ${record.paneId}, cwd ${record.cwd}`,
+				);
 				const text = [
 					started.length > 0
-						? `Spawned ${started.length} herdr agent(s). Their results arrive together as one message once all finish. The \`wait\` tool does not track herdr agents: continue other work or end your turn.`
+						? `Spawned ${started.length} herdr agent(s). Each result arrives as its own message when that agent finishes. Check on them with herdr_agents; the \`wait\` tool does not track herdr agents.`
 						: "No herdr agent started.",
 					...lines,
 					...startErrors,
@@ -346,10 +372,14 @@ export default function ompHerdr(pi: ExtensionAPI) {
 			const outcomes = await Promise.all(
 				started.map(run => {
 					const index = names.indexOf(run.name);
-					return waitForResult(run, 0, signal, state => setState(index, `${state} in pane ${run.paneId}`)).then(outcome => {
-						setState(index, outcome.status);
-						return outcome;
-					});
+					const pane = `pane ${run.record.paneId}`;
+					return run
+						.wait(0, signal, progress => setState(index, `${formatProgress(progress, Date.now())} · ${pane}`))
+						.then((outcome: Outcome) => {
+							const usage = formatUsage(outcome.usage, outcome.toolCalls);
+							setState(index, [outcome.status, usage, pane].filter(Boolean).join(" · "));
+							return outcome;
+						});
 				}),
 			);
 			const text = [...outcomes.map(formatOutcome), ...startErrors].join("\n\n");
@@ -362,30 +392,101 @@ export default function ompHerdr(pi: ExtensionAPI) {
 		name: "herdr_send",
 		label: "Herdr Send",
 		loadMode: "essential",
-		description:
-			"Send a follow-up message to a herdr agent that `herdr_task` spawned in this session, and return its next final message. The agent keeps its context.",
+		description: [
+			"Send a message to a herdr agent that `herdr_task` spawned in this session: a follow-up, or a reply to its message.",
+			"A working agent reads it as a steer and keeps going in the same turn; an idle agent starts a new turn. The agent keeps its context.",
+			"Returns the agent's next final message, or with background true returns at once and delivers it later as a message.",
+		].join("\n"),
 		parameters: herdrSendParams,
 		async execute(_toolCallId, params, signal, onUpdate) {
-			const run = runs.get(params.name);
-			if (!run) {
-				const known = [...runs.keys()].join(", ") || "none";
-				throw new Error(`No herdr agent named "${params.name}" was spawned in this session. Known: ${known}.`);
-			}
+			const run = runNamed(params.name);
+			if (run.gone) throw new Error(`herdr agent ${run.name} no longer exists (pane ${run.record.paneId}).`);
 			// Turns that ended before this message (including ones a human typed into the
 			// pane) are not the reply. A message sent while the agent works steers the
 			// current turn; its end is the reply.
-			const afterSeq = (await readResult(run.runDir))?.seq ?? 0;
+			const afterSeq = await run.latestSeq();
 			await herdr.prompt(run.name, params.message, PROMPT_TIMEOUT_MS);
-			const background = params.background ?? lookup("async.enabled")?.get(pi.pi.settings) === true;
-			if (background) {
-				deliverLater(waitForResult(run, afterSeq, undefined, () => {}).then(outcome => [outcome]));
+			if (useBackground(params.background)) {
+				await run.awaitInBackground(afterSeq);
 				const text = `Sent to \`${run.name}\`. Its reply arrives as a message; the \`wait\` tool does not track herdr agents.`;
 				return { content: [{ type: "text", text }] };
 			}
-			const outcome = await waitForResult(run, afterSeq, signal, state =>
-				onUpdate?.({ content: [{ type: "text", text: `${run.name}: ${state}` }] }),
+			const outcome = await run.wait(afterSeq, signal, progress =>
+				onUpdate?.({ content: [{ type: "text", text: `${run.name}: ${formatProgress(progress, Date.now())}` }] }),
 			);
 			return { content: [{ type: "text", text: formatOutcome(outcome) }], isError: outcome.status !== "completed" };
+		},
+	});
+
+	pi.registerTool({
+		name: "herdr_agents",
+		label: "Herdr Agents",
+		loadMode: "essential",
+		description:
+			"List, inspect, interrupt, or close the herdr agents that `herdr_task` spawned in this session. Use it where you would read `proc://` or `agent://` for `task` subagents.",
+		parameters: herdrAgentsParams,
+		async execute(_toolCallId, params) {
+			const reply = (text: string) => ({ content: [{ type: "text" as const, text }] });
+
+			if (params.action === "list") {
+				if (runs.size === 0) return reply("No herdr agents spawned in this session.");
+				const live = new Map((await herdr.listAgents()).map(agent => [agent.name, agent.agent_status]));
+				const now = Date.now();
+				const blocks = [...runs.values()].map(run => {
+					const { record, progress, result } = run;
+					const state = run.gone ? "gone" : (live.get(record.name) ?? "gone");
+					const activity = progress?.state === "working" ? ` · ${formatProgress(progress, now)}` : "";
+					const last = result
+						? `${result.status} (turn ${result.seq}, ${result.finishedAt}) · ${formatUsage(result.usage, result.toolCalls)}`
+						: "none yet";
+					return [
+						`- ${record.name} (${record.agent}) — ${state}${activity}`,
+						`  pane ${record.paneId} · workspace ${record.workspaceId} · cwd ${record.cwd}`,
+						`  task: ${record.task.replace(/\s+/g, " ")}`,
+						`  last result: ${last}`,
+					].join("\n");
+				});
+				return reply(blocks.join("\n"));
+			}
+
+			if (!params.name) throw new Error(`action "${params.action}" needs a name.`);
+			const run = runNamed(params.name);
+			const { record } = run;
+
+			switch (params.action) {
+				case "output": {
+					const result = await readRunFile(record.runDir, "result");
+					if (!result) return reply(`${record.name} has not finished a turn yet.`);
+					const usage = formatUsage(result.usage, result.toolCalls);
+					const header = `## ${record.name} — ${result.status} (turn ${result.seq}, ${result.finishedAt})${usage ? ` · ${usage}` : ""}`;
+					const error = result.error ? `\nerror: ${result.error}` : "";
+					return reply(`${header}${error}\n\n${result.output || "(no final message)"}`);
+				}
+				case "transcript": {
+					const sessionFile =
+						(await readRunFile(record.runDir, "progress"))?.sessionFile ?? run.result?.sessionFile;
+					if (!sessionFile) throw new Error(`${record.name} has no session file yet.`);
+					const text = await fs.readFile(sessionFile, "utf8");
+					return reply(formatTranscript(text, params.lines ?? DEFAULT_TRANSCRIPT_LINES) || "(empty transcript)");
+				}
+				case "cancel": {
+					const stopped = await run.interrupt();
+					return reply(
+						stopped
+							? `Interrupted ${record.name}. Its turn ended as aborted; a waiting call or background request reports it.`
+							: `Sent Esc to ${record.name}, but it still reports working. Check its pane ${record.paneId}.`,
+					);
+				}
+				case "close": {
+					await herdr.closePane(record.paneId).catch(error => {
+						if (!(error instanceof HerdrError) || error.code !== "pane_not_found") throw error;
+					});
+					run.stop(`Closed by the parent agent.`);
+					runs.delete(record.name);
+					pi.appendEntry(CLOSED_ENTRY, { name: record.name });
+					return reply(`Closed ${record.name} (pane ${record.paneId}).`);
+				}
+			}
 		},
 	});
 }

@@ -174,6 +174,10 @@ export const herdr = {
 		return (await call(args, AgentResult)).agent;
 	},
 
+	async closePane(pane: string) {
+		await call(["pane", "close", pane], Ok);
+	},
+
 	async sendKeys(target: string, keys: string[]) {
 		await call(["agent", "send-keys", target, ...keys], Ok);
 	},
