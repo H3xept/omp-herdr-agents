@@ -1,9 +1,13 @@
 {
-	"name": "omp-herdr",
+	"name": "omp-herdr-agents",
 	"version": "0.1.0",
 	"description": "omp plugin: spawn omp subagents as interactive sessions in herdr workspaces, tabs, or panes, each in its own working directory",
 	"keywords": ["omp", "oh-my-pi", "omp-plugin", "herdr", "agents", "subagents"],
 	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/H3xept/omp-herdr-agents.git"
+	},
 	"type": "module",
 	"files": ["src", "README.md", "CHANGELOG.md", "LICENSE"],
 	"omp": {

@@ -27,6 +27,9 @@ const PROMPT_TIMEOUT_MS = 60_000;
 const POLL_MS = 1_000;
 const STATUS_EVERY_POLLS = 3;
 const MAX_INLINE_OUTPUT = 30_000;
+/** How long a freshly created pane may take to start its shell. */
+const SHELL_READY_TIMEOUT_MS = 15_000;
+const SHELL_READY_POLL_MS = 250;
 
 type Placement = "workspace" | "tab" | "pane";
 
@@ -38,8 +41,6 @@ interface Run {
 	paneId: string;
 	workspaceId: string;
 	runDir: string;
-	/** `seq` of the last result the parent consumed. */
-	seq: number;
 }
 
 /** What a waiting call reports for one agent. */
@@ -162,13 +163,33 @@ export default function ompHerdr(pi: ExtensionAPI) {
 			label: name,
 			env: { [ENV_RUN_DIR]: runDir },
 		});
-		await herdr.startAgent({ name, pane: pane.pane_id, argv, timeoutMs: START_TIMEOUT_MS });
+		// herdr reports a new pane as `agent_pane_busy` until its shell is up.
+		const shellDeadline = Date.now() + SHELL_READY_TIMEOUT_MS;
+		for (;;) {
+			try {
+				await herdr.startAgent({ name, pane: pane.pane_id, argv, timeoutMs: START_TIMEOUT_MS });
+				break;
+			} catch (error) {
+				const starting = error instanceof HerdrError && error.code === "agent_pane_busy";
+				if (!starting || Date.now() > shellDeadline) throw error;
+				await Bun.sleep(SHELL_READY_POLL_MS);
+			}
+		}
 		await herdr.prompt(name, buildAssignment(item.task), PROMPT_TIMEOUT_MS);
-		return { name, agent: agent.name, cwd, paneId: pane.pane_id, workspaceId: pane.workspace_id, runDir, seq: 0 };
+		return { name, agent: agent.name, cwd, paneId: pane.pane_id, workspaceId: pane.workspace_id, runDir };
 	}
 
-	/** Poll the run directory for the next result; watch herdr for an agent that quit. */
-	async function waitForResult(run: Run, signal: AbortSignal | undefined, onState: (state: string) => void) {
+	/**
+	 * Poll the run directory for the first result newer than `afterSeq`; watch
+	 * herdr for an agent that quit. Each waiter keeps its own baseline, so a
+	 * background waiter and a `herdr_send` waiter on one agent both see the turn.
+	 */
+	async function waitForResult(
+		run: Run,
+		afterSeq: number,
+		signal: AbortSignal | undefined,
+		onState: (state: string) => void,
+	) {
 		const startedAt = Date.now();
 		const outcome = (status: Outcome["status"], output: string, error?: string): Outcome => ({
 			run,
@@ -180,8 +201,7 @@ export default function ompHerdr(pi: ExtensionAPI) {
 		});
 		for (let poll = 0; ; poll++) {
 			const result = await readResult(run.runDir);
-			if (result && result.seq > run.seq) {
-				run.seq = result.seq;
+			if (result && result.seq > afterSeq) {
 				return outcome(result.status, result.output, result.error);
 			}
 			if (signal?.aborted) {
@@ -195,7 +215,7 @@ export default function ompHerdr(pi: ExtensionAPI) {
 					if (!(error instanceof HerdrError) || error.code !== "agent_not_found") throw error;
 					// The agent may have reported just before it exited.
 					const last = await readResult(run.runDir);
-					if (last && last.seq > run.seq) continue;
+					if (last && last.seq > afterSeq) continue;
 					return outcome("lost", "", `herdr agent ${run.name} exited or left pane ${run.paneId} before reporting.`);
 				}
 			}
@@ -303,7 +323,7 @@ export default function ompHerdr(pi: ExtensionAPI) {
 
 			const background = params.background ?? lookup("async.enabled")?.get(pi.pi.settings) === true;
 			if (background) {
-				if (started.length > 0) deliverLater(Promise.all(started.map(run => waitForResult(run, undefined, () => {}))));
+				if (started.length > 0) deliverLater(Promise.all(started.map(run => waitForResult(run, 0, undefined, () => {}))));
 				const lines = started.map(run => `- \`${run.name}\` (${run.agent}) in herdr pane ${run.paneId}, cwd ${run.cwd}`);
 				const text = [
 					started.length > 0
@@ -318,7 +338,7 @@ export default function ompHerdr(pi: ExtensionAPI) {
 			const outcomes = await Promise.all(
 				started.map(run => {
 					const index = names.indexOf(run.name);
-					return waitForResult(run, signal, state => setState(index, `${state} in pane ${run.paneId}`)).then(outcome => {
+					return waitForResult(run, 0, signal, state => setState(index, `${state} in pane ${run.paneId}`)).then(outcome => {
 						setState(index, outcome.status);
 						return outcome;
 					});
@@ -343,14 +363,18 @@ export default function ompHerdr(pi: ExtensionAPI) {
 				const known = [...runs.keys()].join(", ") || "none";
 				throw new Error(`No herdr agent named "${params.name}" was spawned in this session. Known: ${known}.`);
 			}
+			// Turns that ended before this message (including ones a human typed into the
+			// pane) are not the reply. A message sent while the agent works steers the
+			// current turn; its end is the reply.
+			const afterSeq = (await readResult(run.runDir))?.seq ?? 0;
 			await herdr.prompt(run.name, params.message, PROMPT_TIMEOUT_MS);
 			const background = params.background ?? lookup("async.enabled")?.get(pi.pi.settings) === true;
 			if (background) {
-				deliverLater(waitForResult(run, undefined, () => {}).then(outcome => [outcome]));
+				deliverLater(waitForResult(run, afterSeq, undefined, () => {}).then(outcome => [outcome]));
 				const text = `Sent to \`${run.name}\`. Its reply arrives as a message; the \`wait\` tool does not track herdr agents.`;
 				return { content: [{ type: "text", text }] };
 			}
-			const outcome = await waitForResult(run, signal, state =>
+			const outcome = await waitForResult(run, afterSeq, signal, state =>
 				onUpdate?.({ content: [{ type: "text", text: `${run.name}: ${state}` }] }),
 			);
 			return { content: [{ type: "text", text: formatOutcome(outcome) }], isError: outcome.status !== "completed" };

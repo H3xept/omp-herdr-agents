@@ -10,9 +10,6 @@
         "@types/bun": "latest",
         "typescript": "^5",
       },
-      "peerDependencies": {
-        "@oh-my-pi/pi-coding-agent": ">=18.10.4",
-      },
     },
   },
   "packages": {

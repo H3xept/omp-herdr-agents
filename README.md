@@ -1,8 +1,8 @@
-# omp-herdr
+# omp-herdr-agents
 
 An [omp](https://omp.sh) plugin that spawns omp subagents as interactive omp sessions in [herdr](https://herdr.dev). Each agent runs in its own working directory and gets its own herdr workspace, tab, or pane.
 
-The built-in `task` tool runs subagents inside the parent process, in the parent's working directory. You cannot watch them or talk to them. `omp-herdr` adds two tools with the same contract as `task`:
+The built-in `task` tool runs subagents inside the parent process, in the parent's working directory. You cannot watch them or talk to them. `omp-herdr-agents` adds two tools with the same contract as `task`:
 
 - `herdr_task` spawns agents (`scout`, `task`, `reviewer`, or your own agent definitions) in any directory. The final message of each agent is the tool result.
 - `herdr_send` sends a follow-up to an agent that `herdr_task` spawned. The agent keeps its context.
@@ -19,15 +19,15 @@ The agents stay open in herdr after they finish, so you can read their work, typ
 ## Install
 
 ```sh
-omp plugin install github:<owner>/omp-herdr
+omp plugin install github:H3xept/omp-herdr-agents
 # or, from a local checkout:
-git clone https://github.com/<owner>/omp-herdr && omp plugin link ./omp-herdr
+git clone https://github.com/H3xept/omp-herdr-agents && omp plugin link ./omp-herdr-agents
 ```
 
 To try it for one session without installing:
 
 ```sh
-omp -e /path/to/omp-herdr/src/index.ts
+omp -e /path/to/omp-herdr-agents/src/index.ts
 ```
 
 ## Usage
@@ -84,7 +84,7 @@ sequenceDiagram
 ## Behavior notes
 
 - **Approvals.** Child agents run with `--approval-mode yolo`, like headless `task` subagents. Set `OMP_HERDR_APPROVAL_MODE` (for example `write` or `always-ask`) in the parent's environment to change this. A child that waits for approval keeps the parent waiting.
-- **Human input.** A message that you type into a child pane also ends a turn. While the parent waits, that turn's final message becomes the result.
+- **Steering.** You can type into a child pane while it works. omp treats that message as a steer: the agent reads it after its current tool call and keeps going in the same turn. The parent receives one result, at the end of the steered turn. A message to an idle child starts a new turn; `herdr_send` ignores that turn and waits for the reply to its own message.
 - **Structured output.** For agents with an `output` schema (such as `scout`), the child is told to answer with one JSON object that matches the schema. Nothing validates it.
 - **Cancellation.** When the parent aborts a blocking call, the plugin sends `Esc` to each child and stops waiting. The panes stay open.
 - **Cleanup.** The plugin never closes panes or workspaces. Close them in herdr when you are done. Run directories stay in the system temp directory.
